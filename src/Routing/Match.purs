@@ -15,6 +15,7 @@ import Data.Maybe (Maybe(..))
 import Data.Newtype (class Newtype, unwrap)
 import Data.Semiring.Free (Free, free)
 import Data.Tuple (Tuple(..), snd)
+
 import Data.Validation.Semiring (V, invalid, unV)
 
 import Global (readFloat, isNaN)
@@ -23,98 +24,106 @@ import Routing.Match.Class (class MatchClass)
 import Routing.Match.Error (MatchError(..), showMatchError)
 import Routing.Types (Route, RoutePart(..))
 
-newtype Match a = Match (Route -> V (Free MatchError) (Tuple Route a))
+newtype Match i a = Match (Route -> Tuple i (V (Free MatchError) (Tuple Route a)))
+
+data Input a
+  = ILit String
+  | Input (a -> String)
+  | IEmpty
 
 -- Manual instance due to the `Route` synonym in the above
-instance newtypeMatch :: Newtype (Match a) (List RoutePart -> V (Free MatchError) (Tuple (List RoutePart) a)) where
+instance newtypeMatch :: Newtype (Match (Input a) a) (List RoutePart -> Tuple Input (V (Free MatchError) (Tuple (List RoutePart) a))) where
   wrap = Match
   unwrap (Match m) = m
 
-instance matchMatchClass :: MatchClass Match where
+instance matchMatchClass :: MatchClass (Match Input) where
   lit input = Match \route ->
     case route of
       Cons (Path i) rs | i == input ->
-        pure $ Tuple rs unit
+        Tuple (ILit input) $ pure $ Tuple rs unit
       Cons (Path _) rs ->
-        invalid $ free $  UnexpectedPath input
+        Tuple (ILit input) (invalid $ free $  UnexpectedPath input)
       _ ->
-        invalid $ free ExpectedPathPart
+        Tuple (ILit input) (invalid $ free ExpectedPathPart)
 
   num = Match \route ->
     case route of
       Cons (Path input) rs ->
         let res = readFloat input in
         if isNaN res then
-          invalid $ free ExpectedNumber
+          Tuple (Input show) $ invalid $ free ExpectedNumber
         else
-          pure $ Tuple rs res
+          Tuple (Input show) $ pure $ Tuple rs res
       _ ->
-        invalid $ free ExpectedNumber
+        Tuple (Input show) $ invalid $ free ExpectedNumber
 
   int = Match \route ->
     case route of
       Cons (Path input) rs -> case fromString input of
-        Nothing -> invalid $ free ExpectedInt
-        Just res -> pure $ Tuple rs res
+        Nothing -> Tuple (Input show) $ invalid $ free ExpectedInt
+        Just res -> Tuple (Input show) $ pure $ Tuple rs res
       _ ->
-        invalid $ free ExpectedInt
+        Tuple (Input show) $ invalid $ free ExpectedInt
 
   bool = Match \route ->
     case route of
       Cons (Path input) rs | input == "true" ->
-        pure $ Tuple rs true
+        Tuple (Input show) $ pure $ Tuple rs true
       Cons (Path input) rs | input == "false" ->
-        pure $ Tuple rs false
+        Tuple (Input show) $ pure $ Tuple rs false
       _ ->
-        invalid $ free ExpectedBoolean
+        Tuple (Input show) $ invalid $ free ExpectedBoolean
 
   str = Match \route ->
     case route of
       Cons (Path input) rs ->
-        pure $ Tuple rs input
+        Tuple (Input id) $ pure $ Tuple rs input
       _ ->
-        invalid $ free ExpectedString
+        Tuple (Input id) $ invalid $ free ExpectedString
 
   param key = Match \route ->
     case route of
       Cons (Query map) rs ->
         case M.lookup key map of
           Nothing ->
-            invalid $ free $ KeyNotFound key
+            Tuple (Input ?encodeKeyVal) $ invalid $ free $ KeyNotFound key
           Just el ->
-            pure $ Tuple (Cons (Query <<< M.delete key $ map) rs) el
+            Tuple (Input ?encodeKeyVal) $ pure $ Tuple (Cons (Query <<< M.delete key $ map) rs) el
       _ ->
-        invalid $ free ExpectedQuery
+        Tuple (Input ?encodeKeyVal) $ invalid $ free ExpectedQuery
+    where
+      encodeKeyVal key val = "?" <> key <> "=" <> val
 
   params = Match \route ->
     case route of
       Cons (Query map) rs ->
-        pure $ Tuple rs map
+        Tuple (Input \_ -> "") $ pure $ Tuple rs map
       _ ->
-        invalid $ free ExpectedQuery
+        Tuple (Input \_ -> "") $ invalid $ free ExpectedQuery
 
   end = Match \route ->
     case route of
-      Nil -> pure $ Tuple Nil unit
-      _ -> invalid $ free ExpectedEnd
+      Nil -> Tuple IEmpty $ pure $ Tuple Nil unit
+      _ -> Tuple IEmpty $ invalid $ free ExpectedEnd
 
   fail msg = Match \_ ->
-    invalid $ free $ Fail msg
+    Tuple IEmpty $ invalid $ free $ Fail msg
 
-instance matchFunctor :: Functor Match where
+instance matchFunctor :: Functor (Match Input) where
   map fn (Match r2e) = Match $ \r ->
-    unV invalid (\(Tuple rs a) -> pure $ Tuple rs (fn a)) $ r2e r
+    let Tuple i m = r2e r
+    in Tuple i $ unV invalid (\(Tuple rs a) -> pure $ Tuple rs (fn a)) m
 
-instance matchAlt :: Alt Match where
+instance matchAlt :: Alt (Match Input) where
   alt (Match r2e1) (Match r2e2) = Match $ \r -> do
     (r2e1 r) <|> (r2e2 r)
 
-instance matchPlus :: Plus Match where
-  empty = Match $ const $ invalid one
+instance matchPlus :: Plus (Match Input) where
+  empty = Match $ const $ Tuple IEmpty (invalid one)
 
-instance matchAlternative :: Alternative Match
+instance matchAlternative :: Alternative (Match Input)
 
-instance matchApply :: Apply Match where
+instance matchApply :: Apply (Match Input) where
   apply (Match r2a2b) (Match r2a) =
     Match $ (\r -> unV (processFnErr r) processFnRes (r2a2b r))
     where processFnErr r err =
@@ -142,9 +151,9 @@ list (Match r2a) =
 
 -- It groups `Free MatchError` -> [[MatchError]] -map with showMatchError ->
 -- [[String]] -fold with semicolon-> [String] -fold with newline-> String
-runMatch :: forall a. Match a -> Route -> Either String a
+runMatch :: forall i a. Match i a -> Route -> Either String a
 runMatch (Match fn) route =
-  unV foldErrors (Right <<< snd) $ fn route
+  unV foldErrors (Right <<< snd) $ snd $ fn route
   where
   foldErrors errs =
     Left $ foldl (\b a -> a <> "\n" <> b) "" do
@@ -183,5 +192,7 @@ eitherMatch (Match r2eab) = Match $ \r ->
 -- | runMatch (lit "path" *> optParams) (parse id "path/?a=1")
 -- | -- (Right (fromFoldable [(Tuple "a" "1")]))
 -- | ```
-optionalMatch :: forall a. Match a -> Match (Maybe a)
-optionalMatch (Match fn) = Match (\route -> unV (const $ pure (Tuple route Nothing)) (pure <<< map Just) $ fn route)
+optionalMatch :: forall i a. Match i a -> Match i (Maybe a)
+optionalMatch (Match fn) = Match (\route -> 
+  let Tuple i m = fn route
+  in Tuple i $ unV (const $ pure (Tuple route Nothing)) (pure <<< map Just) m)
